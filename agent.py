@@ -155,6 +155,9 @@ class WindowedAccumulator:
         self.events: deque = deque()
         self.lvr_cum = 0.0
         self.fee_cum = 0.0
+        self.last_t = 0.0
+        self.last_price = float("nan")
+        self.last_L = 0
 
     def add(self, t: float, lvr_inc: float, fee_inc: float) -> None:
         self.events.append((t, lvr_inc, fee_inc))
@@ -169,6 +172,33 @@ class WindowedAccumulator:
     def ratio(self) -> float:
         return self.fee_cum / self.lvr_cum if self.lvr_cum > 0 else float("inf")
 
+    def add_swap(
+        self,
+        t: float,
+        volatility_ann: float,
+        price: float,
+        liquidity: int,
+        amount0: int,
+        amount1: int,
+    ) -> None:
+        if self.last_t > 0 and self.last_L > 0 and math.isfinite(volatility_ann):
+            dt = t - self.last_t
+            lvr_per_sec_prev = lvr_rate_dollars_per_sec(
+                volatility_ann, self.last_L, self.last_price, DEC0, DEC1
+            )
+            lvr_per_sec = lvr_rate_dollars_per_sec(
+                volatility_ann, liquidity, price, DEC0, DEC1
+            )
+            lvr_inc = 0.5 * (lvr_per_sec_prev + lvr_per_sec) * dt
+        else:
+            lvr_inc = 0.0
+
+        fee_inc = fee_dollars_from_swap(
+            amount0, amount1, price, fee_pips=500, dec0=DEC0, dec1=DEC1
+        )
+        self.add(t, lvr_inc, fee_inc)
+        self.last_t, self.last_price, self.last_L = t, price, liquidity
+
 # compute fee revenue on one swap given fee tier
 def fee_dollars_from_swap(amount0: int, amount1: int, price_usdc_per_weth: float, 
                           fee_pips: int=500,
@@ -178,12 +208,7 @@ def fee_dollars_from_swap(amount0: int, amount1: int, price_usdc_per_weth: float
     return notional_usdc * (fee_pips / 1_000_000)
 
 # decode Swap() event from logs
-async def stream_swaps(ref: Latest, rv: RealizedVol) -> None:
-    wa = WindowedAccumulator() # default 1 hour
-    last_t = 0.0
-    last_price = float("nan")
-    last_L = 0
-
+async def stream_swaps(ref: Latest, rv: RealizedVol, wa: WindowedAccumulator) -> None:
     async with AsyncWeb3(WebSocketProvider(BASE_WSS_RPC)) as w3:
         # logs shape
         # address   <-- contract_that_emitted_it
@@ -207,22 +232,14 @@ async def stream_swaps(ref: Latest, rv: RealizedVol) -> None:
                 gap_bps = ((ev["price"] - ref.px) / ref.px) * 10_000 if ref.px == ref.px else float("nan")
                 volatility_ann = rv.volatility_annual()
 
-                if last_t > 0 and last_L > 0 and not math.isnan(volatility_ann):
-                    dt  = t - last_t
-                    lvr_per_sec_prev = lvr_rate_dollars_per_sec(volatility_ann, last_L, last_price, DEC0, DEC1)
-                    lvr_per_sec = lvr_rate_dollars_per_sec(volatility_ann, ev['liq'], ev['price'], DEC0, DEC1)
-                    lvr_inc = 0.5 * (lvr_per_sec_prev + lvr_per_sec) * dt
-                else:
-                    lvr_inc = 0.0
-
-                fee_inc = fee_dollars_from_swap(ev["amount0"], ev["amount1"], ev["price"],
-                                                fee_pips=500, dec0=DEC0, dec1=DEC1)
-                
-                wa.add(t, lvr_inc, fee_inc)
-
-                # roll state forward
-                last_t, last_price, last_L = t, ev["price"], ev["liq"]
-
+                wa.add_swap(
+                    t,
+                    volatility_ann,
+                    ev["price"],
+                    ev["liq"],
+                    ev["amount0"],
+                    ev["amount1"],
+                )
 
                 lvr_per_sec = lvr_rate_dollars_per_sec(volatility_ann, ev['liq'], ev['price'], DEC0, DEC1)
                 # lvr_bps_yr = lvr_rate_dollars_per_year(volatility_ann)
@@ -251,13 +268,13 @@ RETRYABLE_STREAM_ERRORS = (
 )
 
 
-async def stream_swaps_with_retries(ref: Latest, rv: RealizedVol) -> None:
+async def stream_swaps_with_retries(ref: Latest, rv: RealizedVol, wa: WindowedAccumulator) -> None:
     delay = RECONNECT_DELAY_SECONDS
 
     while True:
         started = time.monotonic()
         try:
-            await stream_swaps(ref, rv)
+            await stream_swaps(ref, rv, wa)
         except RETRYABLE_STREAM_ERRORS as err:
             if time.monotonic() - started >= BACKOFF_RESET_SECONDS:
                 delay = RECONNECT_DELAY_SECONDS
@@ -278,12 +295,13 @@ async def main() -> None:
     q = asyncio.Queue(maxsize=8)
     ref = Latest()
     rv = RealizedVol()
+    wa = WindowedAccumulator() # default 1 hour
     pyth_tasks = [
         asyncio.create_task(pyth_poller(q)),
         asyncio.create_task(consume_pyth(q, ref, rv)),
     ]
     try:
-        await stream_swaps_with_retries(ref, rv)
+        await stream_swaps_with_retries(ref, rv, wa)
     finally:
         for task in pyth_tasks:
             task.cancel()
