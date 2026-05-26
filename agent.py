@@ -179,6 +179,11 @@ def fee_dollars_from_swap(amount0: int, amount1: int, price_usdc_per_weth: float
 
 # decode Swap() event from logs
 async def stream_swaps(ref: Latest, rv: RealizedVol) -> None:
+    wa = WindowedAccumulator() # default 1 hour
+    last_t = 0.0
+    last_price = float("nan")
+    last_L = 0
+
     async with AsyncWeb3(WebSocketProvider(BASE_WSS_RPC)) as w3:
         # logs shape
         # address   <-- contract_that_emitted_it
@@ -192,6 +197,7 @@ async def stream_swaps(ref: Latest, rv: RealizedVol) -> None:
         async for payload in w3.socket.process_subscriptions():
             try:
                 log = payload["result"]
+                t = time.time()
                 ev = decode_swap_data(hex_value(log["data"]))
                 # amount0 > 0  means the pool received WETH
                 # amount0 < 0  means the pool sent WETH out
@@ -201,15 +207,34 @@ async def stream_swaps(ref: Latest, rv: RealizedVol) -> None:
                 gap_bps = ((ev["price"] - ref.px) / ref.px) * 10_000 if ref.px == ref.px else float("nan")
                 volatility_ann = rv.volatility_annual()
 
+                if last_t > 0 and last_L > 0 and not math.isnan(volatility_ann):
+                    dt  = t - last_t
+                    lvr_per_sec_prev = lvr_rate_dollars_per_sec(volatility_ann, last_L, last_price, DEC0, DEC1)
+                    lvr_per_sec = lvr_rate_dollars_per_sec(volatility_ann, ev['liq'], ev['price'], DEC0, DEC1)
+                    lvr_inc = 0.5 * (lvr_per_sec_prev + lvr_per_sec) * dt
+                else:
+                    lvr_inc = 0.0
+
+                fee_inc = fee_dollars_from_swap(ev["amount0"], ev["amount1"], ev["price"],
+                                                fee_pips=500, dec0=DEC0, dec1=DEC1)
+                
+                wa.add(t, lvr_inc, fee_inc)
+
+                # roll state forward
+                last_t, last_price, last_L = t, ev["price"], ev["liq"]
+
+
                 lvr_per_sec = lvr_rate_dollars_per_sec(volatility_ann, ev['liq'], ev['price'], DEC0, DEC1)
-                lvr_bps_yr = lvr_rate_dollars_per_year(volatility_ann)
+                # lvr_bps_yr = lvr_rate_dollars_per_year(volatility_ann)
                 print(f"block={block_number} "
                       f"tx={hex_value(log['transactionHash'])[:10]} "
                       f"{side} price={ev['price']:.4f} L={ev['liq']} "
                       f"pyth={ref.px:.4f} gap={gap_bps:+.2f}bps "
-                      f"volatility_ann={volatility_ann*100:.1f}% "
-                      f"lvr_pool_$/hr={lvr_per_sec:.2f} "
-                      f"lvr_bps_yr={lvr_bps_yr:.2f}")
+                      f"volat_ann={volatility_ann*100:.1f}%\n"
+                      f"1h: lvr=${wa.lvr_cum:.2f} "
+                      # f"lvr_bps_yr={lvr_bps_yr:.2f}"
+                      f"fees=${wa.fee_cum:.2f} "
+                      f"ratio={wa.ratio():.2f}")
             except Exception as err:
                 print(f"error: {err}")
 
